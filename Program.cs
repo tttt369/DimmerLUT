@@ -1,14 +1,272 @@
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.Json;
 
 namespace DimmerLUT;
 
 internal static class Program
 {
     [STAThread]
-    private static void Main()
+    private static int Main(string[] args)
     {
+        if (args.Length > 0 && TryRunCli(args, out var exitCode))
+            return exitCode;
+
         ApplicationConfiguration.Initialize();
         Application.Run(new MainForm());
+        return 0;
+    }
+
+    private static bool TryRunCli(string[] args, out int exitCode)
+    {
+        exitCode = 0;
+        switch (args[0].ToLowerInvariant())
+        {
+            case "--list" or "-l" or "list":
+                AttachToParentConsole();
+                ListDisplays();
+                return true;
+
+            case "--set":
+                AttachToParentConsole();
+                if (args.Length < 2 || !int.TryParse(args[1], out var percent))
+                {
+                    Console.Error.WriteLine("--set requires a percentage between 1 and 100, e.g. --set 50");
+                    exitCode = 2;
+                    return true;
+                }
+                exitCode = SetAllCli(percent);
+                return true;
+
+            case "--restore":
+                AttachToParentConsole();
+                exitCode = RestoreAllCli();
+                return true;
+
+            case "--help" or "-h" or "-?" or "/?" or "help":
+                AttachToParentConsole();
+                PrintHelp();
+                return true;
+
+            default:
+                if (args[0].StartsWith("-") || args[0].StartsWith("/"))
+                {
+                    AttachToParentConsole();
+                    Console.Error.WriteLine($"Unknown option: {args[0]}");
+                    Console.Error.WriteLine();
+                    PrintHelp();
+                    exitCode = 2;
+                    return true;
+                }
+                return false;
+        }
+    }
+
+    private static int SetAllCli(int percent)
+    {
+        percent = Math.Clamp(percent, 1, 100);
+
+        var displays = NativeMethods.GetAttachedDisplays();
+        if (displays.Count == 0)
+        {
+            Console.Error.WriteLine("No attached display devices were found.");
+            return 1;
+        }
+
+        var originals = RampStore.Load();
+        var errors = new List<string>();
+        var applied = 0;
+
+        foreach (var display in displays)
+        {
+            IntPtr hdc = NativeMethods.CreateDC("DISPLAY", display.DeviceName, null, IntPtr.Zero);
+            if (hdc == IntPtr.Zero)
+            {
+                errors.Add($"{display.DeviceName}: could not create a display device context");
+                continue;
+            }
+
+            try
+            {
+                // Capture the pre-dim ramp exactly once; later --set runs reuse it.
+                if (!originals.ContainsKey(display.DeviceName))
+                {
+                    if (!NativeMethods.TryGetDeviceGammaRamp(hdc, out var original))
+                    {
+                        errors.Add($"{display.DeviceName}: driver does not expose a readable gamma ramp");
+                        continue;
+                    }
+                    originals[display.DeviceName] = original;
+                }
+
+                var ramp = GammaRamp.CreateScale(percent / 100.0);
+                if (!NativeMethods.SetDeviceGammaRamp(hdc, ref ramp))
+                {
+                    errors.Add($"{display.DeviceName}: driver rejected the gamma ramp");
+                    continue;
+                }
+                applied++;
+            }
+            finally
+            {
+                NativeMethods.DeleteDC(hdc);
+            }
+        }
+
+        if (originals.Count > 0)
+            RampStore.Save(originals);
+
+        foreach (var e in errors)
+            Console.Error.WriteLine($"  ! {e}");
+
+        Console.WriteLine($"Applied {percent}% brightness to {applied} display(s).");
+        if (applied > 0)
+            Console.WriteLine("Run 'DimmerLUT.exe --restore' to restore the original ramps.");
+        return applied > 0 ? 0 : 1;
+    }
+
+    private static int RestoreAllCli()
+    {
+        var originals = RampStore.Load();
+        if (originals.Count == 0)
+        {
+            Console.Error.WriteLine("No saved original ramps found. Nothing to restore.");
+            return 1;
+        }
+
+        var restored = new List<string>();
+        var errors = new List<string>();
+
+        foreach (var (deviceName, original) in originals)
+        {
+            IntPtr hdc = NativeMethods.CreateDC("DISPLAY", deviceName, null, IntPtr.Zero);
+            if (hdc == IntPtr.Zero)
+            {
+                errors.Add($"{deviceName}: could not create a display device context");
+                continue;
+            }
+
+            try
+            {
+                var ramp = original;
+                if (!NativeMethods.SetDeviceGammaRamp(hdc, ref ramp))
+                {
+                    errors.Add($"{deviceName}: driver rejected the original gamma ramp");
+                    continue;
+                }
+                restored.Add(deviceName);
+            }
+            finally
+            {
+                NativeMethods.DeleteDC(hdc);
+            }
+        }
+
+        // Only drop entries that actually restored, so a temporarily-disconnected
+        // monitor keeps its original for a later --restore.
+        foreach (var name in restored)
+            originals.Remove(name);
+
+        if (originals.Count == 0)
+            RampStore.Clear();
+        else
+            RampStore.Save(originals);
+
+        foreach (var e in errors)
+            Console.Error.WriteLine($"  ! {e}");
+
+        Console.WriteLine($"Restored original ramps on {restored.Count} display(s).");
+        return restored.Count > 0 ? 0 : 1;
+    }
+
+    private static void ListDisplays()
+    {
+        var displays = NativeMethods.GetAttachedDisplays();
+        if (displays.Count == 0)
+        {
+            Console.WriteLine("No attached display devices were found.");
+            return;
+        }
+
+        foreach (var d in displays)
+            Console.WriteLine($"{d.DeviceName}\t{d.Description}");
+    }
+
+    private static void PrintHelp()
+    {
+        Console.WriteLine("DimmerLUT - GPU display LUT dimming");
+        Console.WriteLine();
+        Console.WriteLine("Usage:");
+        Console.WriteLine("  DimmerLUT.exe                  Launch the GUI");
+        Console.WriteLine("  DimmerLUT.exe --list           List attached displays");
+        Console.WriteLine("  DimmerLUT.exe --set <1-100>    Set brightness on all displays");
+        Console.WriteLine("  DimmerLUT.exe --restore        Restore saved original ramps");
+        Console.WriteLine("  DimmerLUT.exe --help           Show this help");
+        Console.WriteLine();
+        Console.WriteLine("Notes:");
+        Console.WriteLine("  --set captures the current ramp on first use and reuses it on later");
+        Console.WriteLine("  runs, so --restore always returns the display to its pre-dim state.");
+        Console.WriteLine("  To recapture a new 'original' (e.g. after calibration), run");
+        Console.WriteLine("  --restore first, adjust the display, then --set again.");
+    }
+
+    private const int ATTACH_PARENT_PROCESS = -1;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AttachConsole(int dwProcessId);
+
+    private static void AttachToParentConsole()
+    {
+        if (!AttachConsole(ATTACH_PARENT_PROCESS))
+            return;
+
+        try { Console.OutputEncoding = Encoding.UTF8; } catch { /* ignore */ }
+        Console.SetOut(new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true });
+        Console.SetError(new StreamWriter(Console.OpenStandardError()) { AutoFlush = true });
+    }
+}
+
+internal static class RampStore
+{
+    private static readonly JsonSerializerOptions s_json = new() { IncludeFields = true };
+
+    private static string FilePath => System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "DimmerLUT", "originals.json");
+
+    public static Dictionary<string, GammaRamp> Load()
+    {
+        try
+        {
+            if (!File.Exists(FilePath))
+                return new(StringComparer.OrdinalIgnoreCase);
+
+            var json = File.ReadAllText(FilePath);
+            var data = JsonSerializer.Deserialize<Dictionary<string, GammaRamp>>(json, s_json);
+            return new Dictionary<string, GammaRamp>(data ?? [], StringComparer.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return new(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    public static void Save(Dictionary<string, GammaRamp> data)
+    {
+        try
+        {
+            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(FilePath)!);
+            File.WriteAllText(FilePath, JsonSerializer.Serialize(data, s_json));
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"  ! Could not save original ramps: {ex.Message}");
+        }
+    }
+
+    public static void Clear()
+    {
+        try { File.Delete(FilePath); } catch { /* ignore */ }
     }
 }
 
